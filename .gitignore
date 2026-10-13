@@ -1,0 +1,18 @@
+# 私有配置必须放在 ~/.config/linux-clash/，不要放入本仓库。
+*.yaml
+*.yml
+*.json
+*.log
+*.db
+*.dat
+*.mmdb
+*.gz
+*.zip
+*.tar*
+.env*
+private/
+secrets/
+__pycache__/
+.venv/
+venv/
+dist/
