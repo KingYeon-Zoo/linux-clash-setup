@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """保留 Clash 分流配置的 Linux 用户级部署与订阅更新工具。"""
 import argparse
-import contextlib
 import datetime as dt
 import fcntl
 import getpass
@@ -50,6 +49,20 @@ ClashLoader.yaml_implicit_resolvers = copy.deepcopy(yaml.SafeLoader.yaml_implici
 for _key, _rules in ClashLoader.yaml_implicit_resolvers.items():
     ClashLoader.yaml_implicit_resolvers[_key] = [r for r in _rules if r[0] != "tag:yaml.org,2002:bool"]
 ClashLoader.add_implicit_resolver("tag:yaml.org,2002:bool", re.compile(r"^(?:true|false|True|False|TRUE|FALSE)$"), list("tTfF"))
+
+
+class ClashDumper(yaml.SafeDumper):
+    def represent_mapping(self, tag, mapping, flow_style=None):
+        node = super().represent_mapping(tag, mapping, flow_style)
+        for key, value in node.value:
+            if key.value == "short-id" and value.tag == "tag:yaml.org,2002:str":
+                # 科学计数法形状的十六进制字符串在 Mihomo 中可能被解析成数字。
+                value.style = "'"
+        return node
+
+
+def write_candidate(path, doc):
+    atomic(path, yaml.dump(doc, Dumper=ClashDumper, allow_unicode=True, sort_keys=False))
 
 
 def atomic(path, content, mode=0o600):
@@ -124,7 +137,7 @@ def parse_config(raw):
     return doc
 
 
-def normalized(doc, secret, provider_proxy=None, direct_dns_system=False):
+def normalized(doc, secret, provider_proxy=None, direct_dns_system=False, server_ipv6_transport=False):
     # 只覆盖服务器运行方式；保留节点、分组、规则、DNS 及其相互引用。
     doc = json.loads(json.dumps(doc))
     for key in ("port", "socks-port", "redir-port", "tproxy-port", "listeners",
@@ -142,6 +155,24 @@ def normalized(doc, secret, provider_proxy=None, direct_dns_system=False):
         doc["dns"].pop("listen", None)
         if direct_dns_system:
             doc["dns"]["direct-nameserver"] = ["system"]
+    if server_ipv6_transport:
+        doc["ipv6"] = True
+        dns = doc.setdefault("dns", {})
+        dns["ipv6"] = True
+        dns["nameserver"] = ["system"]
+        dns["proxy-server-nameserver"] = ["system"]
+        proxies = doc.setdefault("proxies", [])
+        direct_name = "DIRECT-IPv6优先"
+        if any(proxy.get("name") == direct_name for proxy in proxies):
+            raise SetupError("订阅节点与服务器直连适配器名称冲突。")
+        for proxy in proxies:
+            proxy["ip-version"] = "ipv6-prefer"
+        proxies.append({"name": direct_name, "type": "direct", "ip-version": "ipv6-prefer"})
+        for group in doc["proxy-groups"]:
+            if "proxies" in group:
+                group["proxies"] = [direct_name if item == "DIRECT" else item for item in group["proxies"]]
+        doc["rules"] = [",".join(direct_name if item == "DIRECT" else item for item in rule.split(","))
+                        for rule in doc["rules"]]
     for provider in (doc.get("proxy-providers") or {}).values():
         if provider.get("type") == "http":
             provider["interval"] = 86400
@@ -343,13 +374,14 @@ def install(args):
     doc = parse_config(raw)
     secret = secrets.token_urlsafe(32)
     saved = {"url": url, "secret": secret, "version": VERSION, "provider_proxy": args.provider_proxy,
-             "direct_dns_system": args.direct_dns_system,
+             "direct_dns_system": args.direct_dns_system, "server_ipv6_transport": args.server_ipv6_transport,
              "installed_at": dt.datetime.now(dt.timezone.utc).isoformat()}
     # 在所有校验完成之前，不修改登录环境和服务。
     download_core(args.binary, args.binary_sha256)
     prepare_assets(doc, args.assets_dir)
     candidate = CONFIG / "candidate.yaml"
-    atomic(candidate, yaml.safe_dump(normalized(doc, secret, args.provider_proxy, args.direct_dns_system), allow_unicode=True, sort_keys=False))
+    write_candidate(candidate, normalized(doc, secret, args.provider_proxy, args.direct_dns_system,
+                                          args.server_ipv6_transport))
     validate(candidate)
     if (CONFIG / "config.yaml").exists():
         atomic(CONFIG / "config.before-reinstall.yaml", (CONFIG / "config.yaml").read_bytes())
@@ -374,33 +406,72 @@ def install(args):
     print('新 SSH 会话自动设置代理；当前会话执行：. "$HOME/.config/linux-clash/proxy.sh"')
 
 
+def live_selectors():
+    response = api("GET", "/proxies")
+    proxies = response.get("proxies")
+    if not isinstance(proxies, dict):
+        raise SetupError("Mihomo 控制接口未返回策略组。")
+    return {name: proxy for name, proxy in proxies.items()
+            if proxy.get("type") == "Selector" and name != "GLOBAL"}
+
+
+def restore_selections(previous, fallback):
+    live = live_selectors()
+    expected = {}
+    for name, group in live.items():
+        members = group.get("all", [])
+        choice = previous.get(name)
+        if choice not in members:
+            choice = fallback.get(name)
+        if choice not in members or not choice:
+            continue
+        expected[name] = choice
+        if group.get("now") != choice:
+            endpoint = "/proxies/" + urllib.parse.quote(name, safe="")
+            api("PUT", endpoint, {"name": choice})
+    live = live_selectors()
+    if any(live.get(name, {}).get("now") != choice for name, choice in expected.items()):
+        raise SetupError("Mihomo 策略组选择未生效。")
+    return sum(live.get(name, {}).get("now") != choice for name, choice in previous.items())
+
+
 def update():
     conf = settings()
     raw = fetch(conf["url"])
     doc = parse_config(raw)
     candidate = CONFIG / "candidate.yaml"
-    atomic(candidate, yaml.safe_dump(normalized(doc, conf["secret"], conf.get("provider_proxy"), conf.get("direct_dns_system", False)), allow_unicode=True, sort_keys=False))
+    write_candidate(candidate, normalized(doc, conf["secret"], conf.get("provider_proxy"),
+                                          conf.get("direct_dns_system", False),
+                                          conf.get("server_ipv6_transport", False)))
     validate(candidate)
     current = CONFIG / "config.yaml"
     old = current.read_bytes()
     old_source = (CONFIG / "source.yaml").read_bytes()
+    previous_selections = {name: proxy["now"] for name, proxy in live_selectors().items() if proxy.get("now")}
     atomic(CONFIG / "config.previous.yaml", old)
     atomic(CONFIG / "source.previous.yaml", old_source)
     atomic(current, candidate.read_bytes())
     try:
         api("PUT", "/configs?force=true", {"path": str(current)}, timeout=120)
-    except SetupError:
+        changed = restore_selections(previous_selections, conf.get("manual_selections") or {})
+    except SetupError as exc:
         atomic(current, old)
-        with contextlib.suppress(SetupError):
+        try:
             api("PUT", "/configs?force=true", {"path": str(current)}, timeout=120)
-        raise SetupError("新订阅热加载失败，已还原旧配置文件；请检查服务状态。") from None
+            if restore_selections(previous_selections, {}):
+                raise SetupError("旧策略组选择未全部恢复。")
+        except SetupError:
+            raise SetupError("更新失败，已恢复旧配置文件；运行中的配置恢复失败，请检查服务状态。") from None
+        raise SetupError(f"更新失败，已恢复旧配置和策略组选择。{exc}") from None
     atomic(CONFIG / "source.yaml", raw)
     candidate.unlink(missing_ok=True)
     stamp = {"updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
              "nodes": len(doc.get("proxies") or []), "groups": len(doc["proxy-groups"]), "rules": len(doc["rules"]),
-             "source_sha256": hashlib.sha256(raw).hexdigest()}
+             "source_sha256": hashlib.sha256(raw).hexdigest(), "changed_selections": changed}
     atomic(CONFIG / "last-update.json", json.dumps(stamp, indent=2) + "\n")
     print(f"订阅已更新并热加载：{stamp['nodes']} 个内置节点，{stamp['groups']} 个策略组，{stamp['rules']} 条规则。")
+    if changed:
+        print(f"有 {changed} 个旧策略组选择未保留；已使用可用的备选选择或 Mihomo 默认值。")
 
 
 def status():
@@ -483,6 +554,8 @@ def main():
     setup.add_argument("--assets-dir", help="离线 GeoIP、GeoSite 和 ruleset 缓存目录")
     setup.add_argument("--provider-proxy", help="让规则集下载走指定策略组；不改变业务分流规则")
     setup.add_argument("--direct-dns-system", action="store_true", help="已匹配直连的请求使用系统 DNS，适合原 DoH 不稳定的服务器")
+    setup.add_argument("--server-ipv6-transport", action="store_true",
+                       help="让节点和直连优先走 IPv6，并使用系统 DNS 解析代理入口")
     setup.add_argument("--reinstall", action="store_true", help="显式覆盖现有安装")
     for name in ("update", "status", "test", "start", "stop", "restart", "uninstall"):
         commands.add_parser(name)

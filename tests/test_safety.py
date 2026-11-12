@@ -78,14 +78,15 @@ class SafetyTests(unittest.TestCase):
         self.assert_old_untouched()
 
     def test_reload_failure_restores_old_config_and_retries_restore(self):
-        with patch.object(app, "fetch", return_value=SAMPLE), patch.object(app, "validate"), patch.object(app, "api", side_effect=[app.SetupError("down"), {}]) as api:
-            with self.assertRaises(app.SetupError):
+        with patch.object(app, "fetch", return_value=SAMPLE), patch.object(app, "validate"), patch.object(app, "api") as api:
+            api.side_effect = [{"proxies": {}}, app.SetupError("down"), {}, {"proxies": {}}, {"proxies": {}}]
+            with self.assertRaisesRegex(app.SetupError, "已恢复旧配置和策略组选择"):
                 app.update()
-            self.assertEqual(api.call_count, 2)
+            self.assertEqual([call.args[0] for call in api.call_args_list].count("PUT"), 2)
         self.assert_old_untouched()
 
     def test_successful_update_retains_previous_version_and_timestamp(self):
-        with patch.object(app, "fetch", return_value=SAMPLE), patch.object(app, "validate"), patch.object(app, "api", return_value={}):
+        with patch.object(app, "fetch", return_value=SAMPLE), patch.object(app, "validate"), patch.object(app, "api", return_value={"proxies": {}}):
             with contextlib.redirect_stdout(io.StringIO()):
                 app.update()
         self.assertEqual((self.config / "source.yaml").read_bytes(), SAMPLE)
@@ -103,6 +104,28 @@ class SafetyTests(unittest.TestCase):
         self.assertTrue(result.endswith(original))
         self.assertLess(result.index(app.MARK_START), result.index("return"))
         self.assertEqual((self.config / ".bashrc.before-linux-clash").read_text(), original)
+
+    def test_write_candidate_keeps_quotes_on_reality_short_id(self):
+        source = SAMPLE.replace(b"port: 1080}", b"port: 1080, reality-opts: {short-id: '123456e7'}}")
+        path = self.config / "candidate.yaml"
+        app.write_candidate(path, app.normalized(app.parse_config(source), "DEMO"))
+        self.assertIn("short-id: '123456e7'", path.read_text())
+
+    def test_restore_keeps_available_choices_and_allows_removed_nodes(self):
+        live = {
+            "keep": {"all": ["default", "chosen"], "now": "default"},
+            "fallback": {"all": ["default", "backup"], "now": "default"},
+            "default": {"all": ["default"], "now": "default"},
+        }
+
+        def choose(method, endpoint, payload):
+            live[endpoint.rsplit("/", 1)[1]]["now"] = payload["name"]
+
+        previous = {"keep": "chosen", "fallback": "gone", "default": "gone", "removed": "gone"}
+        with patch.object(app, "live_selectors", return_value=live), patch.object(app, "api", side_effect=choose) as api:
+            self.assertEqual(app.restore_selections(previous, {"fallback": "backup"}), 3)
+            self.assertEqual(api.call_count, 2)
+        self.assertEqual([group["now"] for group in live.values()], ["chosen", "backup", "default"])
 
     def test_nonexistent_provider_group_is_rejected(self):
         with self.assertRaises(app.SetupError):
