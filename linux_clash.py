@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""保留 Clash 分流配置的 Linux 用户级部署与订阅更新工具。"""
+"""保留 Clash 分流配置的 Linux 部署与订阅更新工具。"""
 import argparse
 import datetime as dt
 import fcntl
@@ -33,8 +33,21 @@ DATA = HOME / ".local/share/linux-clash"
 BIN = HOME / ".local/bin"
 UNITS = HOME / ".config/systemd/user"
 SETTINGS = CONFIG / "settings.json"
+SYSTEM = False
 MARK_START = "# >>> linux-clash 自动代理 >>>"
 MARK_END = "# <<< linux-clash 自动代理 <<<"
+
+
+def configure_system():
+    global SYSTEM, CONFIG, DATA, BIN, UNITS, SETTINGS
+    if os.geteuid() != 0:
+        raise SetupError("系统级部署和管理需要 root；请使用 sudo。")
+    SYSTEM = True
+    CONFIG = Path("/etc/linux-clash")
+    DATA = Path("/opt/linux-clash")
+    BIN = Path("/usr/local/bin")
+    UNITS = Path("/etc/systemd/system")
+    SETTINGS = CONFIG / "settings.json"
 
 
 class SetupError(Exception):
@@ -91,7 +104,7 @@ def run(args, *, check=True):
 
 
 def systemctl(*args, check=True):
-    return run(["systemctl", "--user", *args], check=check)
+    return run(["systemctl", *([] if SYSTEM else ["--user"]), *args], check=check)
 
 
 def settings():
@@ -269,8 +282,14 @@ case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$P
 proxy_on() { . "$HOME/.config/linux-clash/proxy.sh"; }
 proxy_off() { unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY; }
 '''
+    if SYSTEM:
+        env = env.replace('$HOME/.config/linux-clash/proxy.sh', '/etc/profile.d/linux-clash.sh')
+        env = env.replace('$HOME/.local/bin', '/usr/local/bin')
+        atomic(Path("/etc/profile.d/linux-clash.sh"), env, 0o644)
+        block = f'{MARK_START}\n[ ! -r /etc/profile.d/linux-clash.sh ] || . /etc/profile.d/linux-clash.sh\n{MARK_END}\n'
+    else:
+        block = f'{MARK_START}\n[ ! -r "$HOME/.config/linux-clash/proxy.sh" ] || . "$HOME/.config/linux-clash/proxy.sh"\n{MARK_END}\n'
     atomic(CONFIG / "proxy.sh", env)
-    block = f'{MARK_START}\n[ ! -r "$HOME/.config/linux-clash/proxy.sh" ] || . "$HOME/.config/linux-clash/proxy.sh"\n{MARK_END}\n'
     targets = [HOME / ".bashrc", HOME / ".profile"]
     targets += [HOME / n for n in (".bash_profile", ".bash_login", ".zshenv") if (HOME / n).exists()]
     if os.environ.get("SHELL", "").endswith("zsh") and HOME / ".zshenv" not in targets:
@@ -285,6 +304,8 @@ proxy_off() { unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_
                 atomic(backup, old)
         # 放在 bashrc 的交互判断之前，使 ssh host 'curl ...' 同样有效。
         atomic(path, block + old, path.stat().st_mode & 0o777 if path.exists() else 0o600)
+    if SYSTEM:
+        return
     envd = HOME / ".config/environment.d/90-linux-clash.conf"
     atomic(envd, "\n".join(f"{k}={v}" for k, v in {
         "http_proxy": "http://127.0.0.1:7890", "https_proxy": "http://127.0.0.1:7890",
@@ -295,7 +316,7 @@ proxy_off() { unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_
 
 def setup_units():
     UNITS.mkdir(parents=True, exist_ok=True)
-    atomic(UNITS / "linux-clash.service", '''[Unit]
+    service = '''[Unit]
 Description=用户级 Mihomo 分流代理
 After=network-online.target
 
@@ -311,8 +332,8 @@ LimitNOFILE=65536
 
 [Install]
 WantedBy=default.target
-''')
-    atomic(UNITS / "linux-clash-update.service", '''[Unit]
+'''
+    updater = '''[Unit]
 Description=每日更新 Clash 完整订阅并校验、热加载
 After=linux-clash.service
 Requires=linux-clash.service
@@ -323,7 +344,21 @@ UMask=0077
 ExecStart="%h/.local/bin/proxyctl" update
 TimeoutStartSec=600
 NoNewPrivileges=true
-''')
+'''
+    if SYSTEM:
+        service = service.replace("用户级", "系统级")
+        service = service.replace("After=network-online.target", "After=network-online.target\nWants=network-online.target")
+        service = service.replace("%h/.local/bin/mihomo", str(BIN / "mihomo"))
+        service = service.replace("%h/.config/linux-clash", str(CONFIG))
+        service = service.replace("WantedBy=default.target", "WantedBy=multi-user.target")
+        updater = updater.replace("%h/.local/bin/proxyctl", str(BIN / "proxyctl"))
+        hardening = ("NoNewPrivileges=true\nProtectSystem=strict\nProtectHome=true\n"
+                     "PrivateTmp=true\nCapabilityBoundingSet=\nRestrictSUIDSGID=true\n"
+                     f"ReadWritePaths={CONFIG}")
+        service = service.replace("NoNewPrivileges=true", hardening)
+        updater = updater.replace("NoNewPrivileges=true", hardening)
+    atomic(UNITS / "linux-clash.service", service, 0o644 if SYSTEM else 0o600)
+    atomic(UNITS / "linux-clash-update.service", updater, 0o644 if SYSTEM else 0o600)
     atomic(UNITS / "linux-clash-update.timer", '''[Unit]
 Description=每天北京时间凌晨更新 Clash 订阅
 
@@ -335,7 +370,7 @@ Unit=linux-clash-update.service
 
 [Install]
 WantedBy=timers.target
-''')
+''', 0o644 if SYSTEM else 0o600)
     systemctl("daemon-reload")
     systemctl("enable", "--now", "linux-clash.service", "linux-clash-update.timer")
 
@@ -354,7 +389,8 @@ def install(args):
                     listener.bind(("127.0.0.1", port))
                 except OSError:
                     raise SetupError(f"本机端口 {port} 已占用；请先处理端口冲突。") from None
-    systemctl("show-environment")
+    if not SYSTEM:
+        systemctl("show-environment")
     for path in (CONFIG, DATA, BIN):
         path.mkdir(parents=True, exist_ok=True)
     CONFIG.chmod(0o700)
@@ -391,14 +427,18 @@ def install(args):
     atomic(SETTINGS, json.dumps(saved, indent=2) + "\n")
     app = DATA / "app/linux_clash.py"
     atomic(app, Path(__file__).read_bytes(), 0o700)
-    atomic(BIN / "proxyctl", "#!/bin/sh\nexec " + shlex.quote(sys.executable) + " " + shlex.quote(str(app)) + ' "$@"\n', 0o700)
+    scope_env = "env LINUX_CLASH_SCOPE=system " if SYSTEM else ""
+    atomic(BIN / "proxyctl", "#!/bin/sh\nexec " + scope_env + shlex.quote(sys.executable) + " " + shlex.quote(str(app)) + ' "$@"\n', 0o700)
     setup_units()
     systemctl("restart", "linux-clash.service")
     # 尝试给当前用户启用 linger；部分服务器允许用户自行启用。
-    result = run(["loginctl", "enable-linger"], check=False)
     setup_shell()
-    linger = run(["loginctl", "show-user", str(os.getuid()), "-p", "Linger"], check=False).stdout.strip()
     print("安装完成；代理端口 127.0.0.1:7890，规则模式，服务与每日更新已启用。")
+    if SYSTEM:
+        print("系统级服务随系统开机启动；当前会话执行：. /etc/profile.d/linux-clash.sh")
+        return
+    run(["loginctl", "enable-linger"], check=False)
+    linger = run(["loginctl", "show-user", str(os.getuid()), "-p", "Linger"], check=False).stdout.strip()
     if linger != "Linger=yes":
         print("尚未启用退出登录后常驻：请管理员执行 sudo loginctl enable-linger <你的用户名>。")
     else:
@@ -479,7 +519,8 @@ def status():
         enabled = systemctl("is-enabled", name, check=False).stdout.strip()
         active = systemctl("is-active", name, check=False).stdout.strip()
         print(f"{name}: {enabled}, {active}")
-    print(run(["loginctl", "show-user", str(os.getuid()), "-p", "Linger"], check=False).stdout.strip())
+    if not SYSTEM:
+        print(run(["loginctl", "show-user", str(os.getuid()), "-p", "Linger"], check=False).stdout.strip())
     print(systemctl("show", "linux-clash-update.timer", "-p", "NextElapseUSecRealtime", check=False).stdout.strip())
     if (CONFIG / "last-update.json").exists():
         doc = json.loads((CONFIG / "last-update.json").read_text())
@@ -530,6 +571,12 @@ def uninstall():
             if 0 <= start < end:
                 new = text[:start] + text[end + len(MARK_END):].lstrip("\n")
                 atomic(path, new, path.stat().st_mode & 0o777)
+    if SYSTEM:
+        Path("/etc/profile.d/linux-clash.sh").unlink(missing_ok=True)
+        systemctl("daemon-reload")
+        print("已卸载系统级服务和登录代理环境；保留私有配置、程序和备份。")
+        print("当前终端请执行 proxy_off，或重新登录。重新安装请使用 --reinstall。")
+        return
     (HOME / ".config/environment.d/90-linux-clash.conf").unlink(missing_ok=True)
     systemctl("daemon-reload")
     # 清理本工具设置的用户管理器变量，保留其他代理配置。
@@ -547,6 +594,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     setup = commands.add_parser("install", help="安装用户级服务与自动代理环境")
+    setup.add_argument("--system", action="store_true", help="以 root 安装系统级服务，配置位于 /etc/linux-clash")
     setup.add_argument("--config", help="现有完整 Clash 配置；未提供时从订阅下载")
     setup.add_argument("--subscription-file", help="私有订阅文件（纯 URL 或含 url 的 JSON）")
     setup.add_argument("--binary", help="离线、已解压的 Linux Mihomo 程序")
@@ -562,6 +610,8 @@ def main():
     args = parser.parse_args()
     try:
         os.umask(0o077)
+        if os.environ.get("LINUX_CLASH_SCOPE") == "system" or getattr(args, "system", False):
+            configure_system()
         if args.command == "install":
             install(args)
         elif args.command == "update":

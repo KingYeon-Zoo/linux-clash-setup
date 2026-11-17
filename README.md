@@ -1,12 +1,40 @@
 # Linux Clash 自动部署
 
-在 Linux 服务器上使用自己的 Clash/Mihomo 完整订阅：保留分流规则，设置用户级后台服务，每天更新订阅，新 SSH 会话自动使用代理。
+在 Linux 服务器上使用自己的 Clash/Mihomo 完整订阅：保留分流规则，设置后台服务，每天更新订阅，新 SSH 会话自动使用代理。支持普通用户部署和有 root 权限时的系统级部署。
 
-已在 Ubuntu 24.04 x86_64 服务器实测。安装过程和验证范围见 [部署记录](docs/部署记录.md)。本仓库只提供工具，不包含作者的订阅、节点、机场地址、私人配置或服务器连接信息。每位使用者需要准备自己的订阅。
+已在 Ubuntu 24.04 和 Alibaba Cloud Linux 3 x86_64 服务器实测。安装过程和验证范围见 [部署记录](docs/部署记录.md)。本仓库只提供工具，不包含作者的订阅、节点、机场地址、私人配置或服务器连接信息。每位使用者需要准备自己的订阅。
 
 从校外登录内网服务器的配置见 [Tailscale 个人 SSH 指南](docs/内网服务器校外访问.md)。
 
-## 一键安装
+## 有 root 权限时安装
+
+使用系统级 systemd，配置保存在 `/etc/linux-clash/`，程序和 Python 虚拟环境保存在 `/opt/linux-clash/`，管理入口是 `/usr/local/bin/proxyctl`。服务随系统开机启动，无需用户会话或 Linger。
+
+```bash
+git clone https://github.com/KingYeon-Zoo/linux-clash-setup.git
+cd linux-clash-setup
+sudo bash install.sh --system
+```
+
+以 root 登录时直接运行 `bash install.sh --system`。同样需要 Python 3.10+，安装器会选择已安装的合适版本。Alibaba Cloud Linux 3 默认 Python 可能是 3.6，可先执行：
+
+```bash
+sudo dnf install -y python3.11 python3.11-pip
+```
+
+Ubuntu 可先执行 `sudo apt-get install -y python3 python3-venv`。系统级安装使用独立虚拟环境安装 PyYAML，代理和控制 API 默认均监听回环地址。安装后执行 `. /etc/profile.d/linux-clash.sh`，新 SSH 会话也会自动加载代理环境。
+
+订阅校验、热加载、失败回滚和每天北京时间 04:00～04:05 更新的逻辑与用户级部署共用。`proxyctl` 的系统级管理需要 root，服务命令使用 `systemctl`，省去 `--user`：
+
+```bash
+sudo proxyctl status
+sudo systemctl start linux-clash-update.service
+sudo journalctl -u linux-clash-update.service -n 20
+```
+
+`--config`、`--subscription-file`、`--binary`、`--binary-sha256`、`--assets-dir` 和 DNS 适配选项同样可用。完整步骤、文件位置和阿里云镜像排障见 [root 系统级部署](docs/root系统级部署.md)。
+
+## 普通用户一键安装
 
 需要 Linux、Python 3.10+、用户级 systemd，以及**包含节点、策略组和 rules 的 HTTPS Clash/Mihomo 完整订阅**。仅含节点的 Base64 通用订阅不适用。默认端口 7890、9090 必须空闲。
 

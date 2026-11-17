@@ -1,4 +1,4 @@
-# 私有配置必须放在 ~/.config/linux-clash/，不要放入本仓库。
+# 私有配置放在 ~/.config/linux-clash/ 或 /etc/linux-clash/，不要放入本仓库。
 *.yaml
 *.yml
 *.json

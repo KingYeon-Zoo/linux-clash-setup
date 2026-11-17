@@ -141,6 +141,24 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(result["rules"], source["rules"])
         self.assertNotEqual(source["dns"]["direct-nameserver"], ["system"])
 
+    def test_system_scope_uses_system_manager_without_user_bus(self):
+        with patch.object(app, "SYSTEM", True), patch.object(app, "run") as run:
+            app.systemctl("restart", "linux-clash.service")
+        run.assert_called_once_with(["systemctl", "restart", "linux-clash.service"], check=True)
+
+    def test_system_units_use_absolute_paths_and_boot_target(self):
+        units = self.home / "system-units"
+        binary_dir = self.home / "bin"
+        with patch.multiple(app, SYSTEM=True, UNITS=units, BIN=binary_dir), patch.object(app, "systemctl"):
+            app.setup_units()
+        service = (units / "linux-clash.service").read_text()
+        updater = (units / "linux-clash-update.service").read_text()
+        self.assertNotIn("%h", service + updater)
+        self.assertIn("WantedBy=multi-user.target", service)
+        self.assertIn(str(binary_dir / "proxyctl"), updater)
+        self.assertIn(f"ReadWritePaths={self.config}", service)
+        self.assertEqual((units / "linux-clash.service").stat().st_mode & 0o777, 0o644)
+
 
 if __name__ == "__main__":
     unittest.main()
